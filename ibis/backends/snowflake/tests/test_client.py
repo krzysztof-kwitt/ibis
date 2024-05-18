@@ -11,6 +11,8 @@ from pytest import param
 
 import ibis
 import ibis.common.exceptions as com
+import ibis.expr.operations as ops
+from ibis.backends.snowflake import _SNOWFLAKE_MAP_UDFS
 from ibis.backends.snowflake.tests.conftest import _get_url
 from ibis.util import gen_name
 
@@ -370,3 +372,20 @@ def test_timestamp_memtable(con):
     t = ibis.memtable(df)
     result = con.to_pandas(t)
     tm.assert_frame_equal(result, df)
+
+
+def test_ibis_udf_are_lazy(con):
+    # Drop UDF if it already created.
+    udf_def = _SNOWFLAKE_MAP_UDFS[ops.ArrayZip]
+    signature = ", ".join(udf_def.inputs.values())
+    query = f"DROP FUNCTION IF EXISTS {udf_def.name}({signature})"
+    with con._safe_raw_sql(query):
+        pass
+
+    a = ibis.literal([1, 2, 3], type="array<int64>")
+    b = ibis.literal([4, 5, 6], type="array<int64>")
+
+    expr = a.zip(b).name("test")
+    result = con.execute(expr)
+
+    assert result == [{"f1": 1, "f2": 4}, {"f1": 2, "f2": 5}, {"f1": 3, "f2": 6}]

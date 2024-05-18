@@ -15,7 +15,7 @@ import textwrap
 import warnings
 from operator import itemgetter
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlretrieve
 
@@ -43,34 +43,45 @@ if TYPE_CHECKING:
     import pandas as pd
 
 
+class _IbisUdf(NamedTuple):
+    name: str
+    inputs: dict[str, str]
+    returns: str
+    source: str
+
+
 _SNOWFLAKE_MAP_UDFS = {
-    "ibis_udfs.public.object_merge": {
-        "inputs": {"obj1": "OBJECT", "obj2": "OBJECT"},
-        "returns": "OBJECT",
-        "source": "return Object.assign(obj1, obj2)",
-    },
-    "ibis_udfs.public.object_values": {
-        "inputs": {"obj": "OBJECT"},
-        "returns": "ARRAY",
-        "source": "return Object.values(obj)",
-    },
-    "ibis_udfs.public.array_zip": {
-        "inputs": {"arrays": "ARRAY"},
-        "returns": "ARRAY",
-        "source": """\
+    ops.MapMerge: _IbisUdf(
+        name="ibis_udfs.public.object_merge",
+        inputs={"obj1": "OBJECT", "obj2": "OBJECT"},
+        returns="OBJECT",
+        source="return Object.assign(obj1, obj2)",
+    ),
+    ops.MapValues: _IbisUdf(
+        name="ibis_udfs.public.object_values",
+        inputs={"obj": "OBJECT"},
+        returns="ARRAY",
+        source="return Object.values(obj)",
+    ),
+    ops.ArrayZip: _IbisUdf(
+        name="ibis_udfs.public.array_zip",
+        inputs={"arrays": "ARRAY"},
+        returns="ARRAY",
+        source="""\
 const longest = arrays.reduce((a, b) => a.length > b.length ? a : b, []);
 const keys = Array.from(Array(arrays.length).keys()).map(key => `f${key + 1}`);
 return longest.map((_, i) => {
     return Object.assign(...keys.map((key, j) => ({[key]: arrays[j][i]})));
 })""",
-    },
-    "ibis_udfs.public.array_repeat": {
+    ),
+    ops.ArrayRepeat: _IbisUdf(
+        name="ibis_udfs.public.array_repeat",
         # Integer inputs are not allowed because JavaScript only supports
         # doubles
-        "inputs": {"value": "ARRAY", "count": "DOUBLE"},
-        "returns": "ARRAY",
-        "source": """return Array(count).fill(value).flat();""",
-    },
+        inputs={"value": "ARRAY", "count": "DOUBLE"},
+        returns="ARRAY",
+        source="""return Array(count).fill(value).flat();""",
+    ),
 }
 
 
@@ -82,9 +93,16 @@ class Backend(SQLBackend, CanCreateCatalog, CanCreateDatabase, CanCreateSchema):
     _latest_udf_python_version = (3, 10)
     _top_level_methods = ("from_snowpark",)
 
-    def __init__(self, *args, _from_snowpark: bool = False, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        create_object_udfs: bool = True,
+        _from_snowpark: bool = False,
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._from_snowpark = _from_snowpark
+        self._create_object_udfs = create_object_udfs
 
     def _convert_kwargs(self, kwargs):
         with contextlib.suppress(KeyError):
@@ -165,20 +183,21 @@ class Backend(SQLBackend, CanCreateCatalog, CanCreateDatabase, CanCreateSchema):
     def current_catalog(self) -> str:
         return self.con.database
 
-    def _make_udf(self, name: str, defn) -> str:
+    def _make_ibis_udf(self, defn: _IbisUdf) -> str:
+        # TODO(krzysztof-kwitt): consider to convert to sqlglot expression
+        # after sqlglot fix is released: https://github.com/tobymao/sqlglot/pull/3504
         signature = ", ".join(
             f"{sg.to_identifier(argname, quoted=self.compiler.quoted).sql(self.name)} {typ}"
-            for argname, typ in defn["inputs"].items()
+            for argname, typ in defn.inputs.items()
         )
-        return_type = defn["returns"]
         return f"""\
-CREATE OR REPLACE FUNCTION {name}({signature})
-RETURNS {return_type}
+CREATE OR REPLACE FUNCTION {defn.name}({signature})
+RETURNS {defn.returns}
 LANGUAGE JAVASCRIPT
 RETURNS NULL ON NULL INPUT
 IMMUTABLE
 AS
-$$ {defn["source"]} $$"""
+$$ {defn.source} $$"""
 
     def do_connect(self, create_object_udfs: bool = True, **kwargs: Any):
         """Connect to Snowflake.
@@ -217,12 +236,9 @@ $$ {defn["source"]} $$"""
         session_parameters = connect_args.pop("session_parameters", {})
 
         self.con = sc.connect(**connect_args)
-        self._setup_session(
-            session_parameters=session_parameters,
-            create_object_udfs=create_object_udfs,
-        )
+        self._setup_session(session_parameters=session_parameters)
 
-    def _setup_session(self, *, session_parameters, create_object_udfs: bool):
+    def _setup_session(self, *, session_parameters):
         con = self.con
 
         # enable multiple SQL statements by default
@@ -249,35 +265,6 @@ $$ {defn["source"]} $$"""
                     " ".join(f"{k} = {v!r}" for k, v in session_parameters.items())
                 )
             )
-
-        if create_object_udfs:
-            database = con.database
-            schema = con.schema
-            dialect = self.name
-            create_stmt = sge.Create(
-                kind="DATABASE", this="ibis_udfs", exists=True
-            ).sql(dialect)
-            use_stmt = sge.Use(
-                kind="SCHEMA",
-                this=sg.table(schema, db=database, quoted=self.compiler.quoted),
-            ).sql(dialect)
-
-            stmts = [
-                create_stmt,
-                # snowflake activates a database on creation, so reset it back
-                # to the original database and schema
-                use_stmt,
-                *itertools.starmap(self._make_udf, _SNOWFLAKE_MAP_UDFS.items()),
-            ]
-
-            stmt = ";\n".join(stmts)
-            with contextlib.closing(con.cursor()) as cur:
-                try:
-                    cur.execute(stmt)
-                except Exception as e:  # noqa: BLE001
-                    warnings.warn(
-                        f"Unable to create Ibis UDFs, some functionality will not work: {e}"
-                    )
 
     @util.experimental
     @classmethod
@@ -320,13 +307,11 @@ $$ {defn["source"]} $$"""
         """
         import snowflake.connector
 
-        backend = cls(_from_snowpark=True)
+        backend = cls(create_object_udfs=create_object_udfs, _from_snowpark=True)
         backend.con = session._conn._conn
         with contextlib.suppress(snowflake.connector.errors.ProgrammingError):
             # stored procs on snowflake don't allow session mutation it seems
-            backend._setup_session(
-                session_parameters={}, create_object_udfs=create_object_udfs
-            )
+            backend._setup_session(session_parameters={})
         return backend
 
     def reconnect(self) -> None:
@@ -404,6 +389,40 @@ $$ {defn["source"]} $$"""
             # round trips per udf
             with self._safe_raw_sql(";\n".join(udf_sources)):
                 pass
+        self._register_IbisUdfs(expr)
+
+    def _register_IbisUdfs(self, expr: ir.Expr) -> None:
+        op = expr.op()
+
+        used_ibis_ddfs = [v for k, v in _SNOWFLAKE_MAP_UDFS.items() if op.find(k)]
+        if self._create_object_udfs and used_ibis_ddfs:
+            database = self.con.database
+            schema = self.con.schema
+            dialect = self.name
+            create_stmt = sge.Create(
+                kind="DATABASE", this="ibis_udfs", exists=True
+            ).sql(dialect)
+            use_stmt = sge.Use(
+                kind="SCHEMA",
+                this=sg.table(schema, db=database, quoted=self.compiler.quoted),
+            ).sql(dialect)
+
+            stmts = [
+                create_stmt,
+                # snowflake activates a database on creation, so reset it back
+                # to the original database and schema
+                use_stmt,
+            ]
+            stmts.extend(self._make_ibis_udf(fn_def) for fn_def in used_ibis_ddfs)
+
+            stmt = ";\n".join(stmts)
+            with contextlib.closing(self.con.cursor()) as cur:
+                try:
+                    cur.execute(stmt)
+                except Exception as e:  # noqa: BLE001
+                    warnings.warn(
+                        f"Unable to create Ibis UDFs, some functionality will not work: {e}"
+                    )
 
     def _compile_python_udf(self, udf_node: ops.ScalarUDF) -> str:
         return """\
